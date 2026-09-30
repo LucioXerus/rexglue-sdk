@@ -14,6 +14,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <fmt/format.h>
@@ -29,6 +30,16 @@ class KernelState;
 namespace rex {
 namespace system {
 namespace xam {
+
+// PARCHE LOCAL - multijugador local (hasta 4 jugadores).
+//
+// Cuantos perfiles de usuario existen a la vez en la consola. La 360 tiene
+// cuatro ranuras de usuario (0..3) y la capa de entrada de este SDK ya las
+// reparte sola -rex::input::kMaxGuestUsers-, pero el estado del kernel solo
+// guardaba UN perfil. Sin perfiles para 1..3 no hay forma de contestar
+// "si, ese usuario tiene sesion iniciada" y el juego nunca ve mas de un
+// jugador. Ver tools/parche_multijugador.py.
+inline constexpr uint32_t kMaxLocalUsers = 4;
 
 struct X_USER_PROFILE_SETTING_DATA {
   // UserProfile::Setting::Type. Appears to be 8-in-32 field, and the upper 24
@@ -214,19 +225,27 @@ class UserProfile {
     }
   };
 
-  UserProfile();
+  // user_index es la ranura de la consola (0..kMaxLocalUsers-1). Existe para
+  // que cada ranura tenga su propio xuid y su propio nombre: el juego pide
+  // XamUserGetName(1) y XamUserGetXUID(1) al montar el jugador 2, y con un
+  // perfil compartido los dos jugadores se llamarian igual.
+  explicit UserProfile(uint32_t user_index = 0);
 
+  uint32_t user_index() const { return user_index_; }
   uint64_t xuid() const { return xuid_; }
   std::string name() const { return name_; }
   uint32_t signin_state() const { return 1; }
   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
 
   void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
+  void set_name(std::string name) { name_ = std::move(name); }
+  void set_xuid(uint64_t xuid) { xuid_ = xuid; }
 
   void AddSetting(std::unique_ptr<Setting> setting);
   Setting* GetSetting(uint32_t setting_id);
 
  private:
+  uint32_t user_index_ = 0;
   uint64_t xuid_;
   std::string name_;
   std::vector<std::unique_ptr<Setting>> setting_list_;

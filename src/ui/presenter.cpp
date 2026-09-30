@@ -80,6 +80,39 @@ REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter", "Guest output 
 REXCVAR_DEFINE_BOOL(present_dither, false, "UI/Presenter",
                     "Enable output dithering in the final present pass")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// PARCHE LOCAL - nota sobre estas dos variables.
+//
+// Se llaman "splitscreen" pero NO son el splitscreen del juego, y conviene
+// tenerlo claro antes de perder una tarde con ellas. Mueven el fotograma
+// entero del guest a un cuadrante de la VENTANA del host:
+//
+//     output_x += (player_idx & 2) ? ancho / 2 : 0;
+//     output_y += (player_idx & 1) ? alto  / 2 : 0;
+//
+// Eso sirve para poner cuatro INSTANCIAS del juego en mosaico sobre una misma
+// pantalla -multibox-, no para que una instancia dibuje cuatro vistas. El
+// splitscreen de verdad -las dos mitades apiladas de Most Wanted, o las que
+// el motor acepte- lo compone el propio juego dentro de su unico framebuffer,
+// asi que el presentador no tiene nada que hacer ahi y estas dos variables
+// nunca han influido en la partida.
+//
+// Se quedan porque no estorban y alguien las puede estar usando para eso, pero
+// llevan kRequiresRestart como sus vecinas -antes no lo llevaban, que es de
+// donde venia la mitad de la confusion- y el nombre ya no promete lo que no
+// hacen. El multijugador local de verdad esta en  local_player_count, en
+// xam_user.cpp.
+REXCVAR_DEFINE_INT32(present_splitscreen_mode, 0, "UI/Presenter",
+                     "Host-window tiling for running several game instances on one screen. "
+                     "0=off, 2=place this instance in a quadrant (see present_splitscreen_player). "
+                     "This is NOT in-game split screen - that is composed by the game itself; "
+                     "use local_player_count for local multiplayer.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(present_splitscreen_player, 0, "UI/Presenter",
+                     "Which quadrant of the host window to place the output in when "
+                     "present_splitscreen_mode=2: 0=top-left, 1=bottom-left, 2=top-right, "
+                     "3=bottom-right.")
+    .range(0, 3)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
                     "Allow overscan cutoff based on safe area settings")
@@ -971,6 +1004,17 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
     // output_width might have been rounded up already by rescale_unsigned, so
     // rounding down in this division.
     flow.output_x = (int32_t(surface_width_in_paint_connection_) - int32_t(output_width)) / 2;
+  }
+
+  // Host-window quadrant offset for multibox - see the cvars above. It was
+  // spliced into the middle of the sentence below and is moved out here so the
+  // original comment reads as it did upstream.
+  if (REXCVAR_GET(present_splitscreen_mode) == 2) {
+    int32_t player_idx = REXCVAR_GET(present_splitscreen_player);
+    int32_t quad_x = (player_idx & 2) ? surface_width_in_paint_connection_ / 2 : 0;
+    int32_t quad_y = (player_idx & 1) ? surface_height_in_paint_connection_ / 2 : 0;
+    flow.output_x += quad_x;
+    flow.output_y += quad_y;
   }
 
   // Convert the location from surface pixels (which have 1:1 aspect ratio

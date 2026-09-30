@@ -21,12 +21,22 @@ namespace rex {
 namespace system {
 namespace xam {
 
-UserProfile::UserProfile() {
+UserProfile::UserProfile(uint32_t user_index) : user_index_(user_index) {
   // 58410A1F checks the user XUID against a mask of 0x00C0000000000000 (3<<54),
   // if non-zero, it prevents the user from playing the game.
   // "You do not have permissions to perform this operation."
-  xuid_ = 0xB13EBABEBABEBABE;
-  name_ = "User";
+  //
+  // PARCHE LOCAL - multijugador local (hasta 4 jugadores).
+  // El desplazamiento por ranura (el +user_index) hace falta para que cada
+  // jugador tenga un XUID distinto: XamUserGetXUID lo devuelve tal cual y el
+  // juego lo usa como clave. Sigue sin tocar el nibble alto, asi que la
+  // comprobacion de 58410A1F sigue dando el mismo resultado que antes.
+  xuid_ = 0xB13EBABEBABEBABE + user_index;
+  // El jugador 1 conserva el nombre de siempre para no cambiar las partidas
+  // guardadas -el contenido se archiva bajo content_root/<title>/<nombre>-, y
+  // a los demas se les pone uno que se distingue en los menus.
+  name_ = user_index == 0 ? std::string("User")
+                          : fmt::format("Player {}", user_index + 1);
 
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195
   // https://github.com/arkem/py360/blob/master/py360/constants.py

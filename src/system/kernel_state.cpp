@@ -65,8 +65,14 @@ KernelState::KernelState(Runtime* emulator)
   file_system_ = emulator->file_system();
 
   app_manager_ = std::make_unique<xam::AppManager>();
-  user_profile_ = std::make_unique<xam::UserProfile>();
-  user_profile_->set_kernel_state(this);
+  // PARCHE LOCAL - multijugador local (hasta 4 jugadores).
+  // Se montan las cuatro ranuras de una vez. Es barato -unos 30 ajustes de
+  // perfil cada una, todos en memoria- y evita tener que crearlas a mitad de
+  // partida, que es justo cuando el juego pregunta por el jugador 2.
+  for (uint32_t user_index = 0; user_index < xam::kMaxLocalUsers; ++user_index) {
+    user_profiles_[user_index] = std::make_unique<xam::UserProfile>(user_index);
+    user_profiles_[user_index]->set_kernel_state(this);
+  }
 
   auto user_data_root = emulator_->user_data_root();
   if (!user_data_root.empty()) {

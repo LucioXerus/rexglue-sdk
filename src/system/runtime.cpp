@@ -9,6 +9,8 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <algorithm>  // PARCHE LOCAL - std::max, para el suelo de la velocidad
+
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/filesystem/devices/host_path_device.h>
@@ -33,6 +35,53 @@ REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
 REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
 REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
 REXCVAR_DEFINE_STRING(metadata_root, "", "Runtime", "Override metadata path");
+
+// PARCHE LOCAL - velocidad del juego ajustable
+//
+// Velocidad a la que pasa el tiempo DENTRO del juego, EN PORCENTAJE: 100 es
+// normal, 50 la mitad, 200 el doble. No tiene nada que ver con el limite de
+// fps: los fps son cuantas veces se dibuja, esto es a que ritmo avanza.
+//
+// En porcentaje y no en multiplicador porque en la ventana de F4 sale un
+// numero pelado, y "1.0" no dice de que. Ademas 0..200 es un recorrido comodo
+// para una barra; 0.05..4.0 se apelotonaba todo a la izquierda.
+//
+// El texto va en ingles porque es lo que sale en esa ventana, que es del SDK
+// y esta entera en ingles.
+REXCVAR_DEFINE_DOUBLE(game_speed, 100.0, "Runtime",
+                      "Speed of in-game time, as a percentage. 100 = normal, 50 = half, "
+                      "200 = double. This is not an fps limit: it changes how fast time "
+                      "passes in the game, not how often it is drawn.")
+    .range(0.0, 200.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+namespace {
+
+// PARCHE LOCAL - velocidad del juego ajustable
+//
+// Pasa el porcentaje a la escala que espera el reloj, con un SUELO. El suelo
+// no es capricho: en src/core/clock.cpp, RecomputeGuestTickScalar hace esto
+// cuando la escala es <= 1.0
+//
+//     frac.second *= static_cast<uint64_t>(10.0 / guest_time_scalar_);
+//
+// Con la escala a cero eso es 10.0/0.0 = infinito, y convertir infinito a
+// uint64_t es comportamiento indefinido; en la practica sale 0 o un numero
+// enorme. Si sale 0, la division de UpdateGuestClock revienta. O sea que un
+// 0% literal no cuelga el juego: lo tumba.
+//
+// Asi que el 0% de la barra se queda en una milesima de la velocidad normal.
+// A ese ritmo el juego esta parado a todos los efectos -un segundo suyo son
+// mas de dieciseis minutos- pero el reloj sigue siendo un numero valido.
+void aplicar_velocidad_del_juego() {
+  const double por_ciento = REXCVAR_GET(game_speed);
+  const double escala = std::max(por_ciento, 0.1) / 100.0;
+  rex::chrono::Clock::set_guest_time_scalar(escala);
+  REXSYS_INFO("[velocidad] el tiempo del juego pasa al {:.0f}% (escala x{:.3f})", por_ciento,
+              escala);
+}
+
+}  // namespace
 
 namespace rex {
 
@@ -107,7 +156,23 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   // Initialize clock
   chrono::Clock::set_guest_tick_frequency(50000000);
   chrono::Clock::set_guest_system_time_base(chrono::Clock::QueryHostSystemTime());
-  chrono::Clock::set_guest_time_scalar(1.0);
+
+  // PARCHE LOCAL - velocidad del juego ajustable
+  //
+  // set_guest_time_scalar escala el reloj del guest ENTERO: el contador de
+  // ticks, la hora del sistema, los temporizadores y las esperas. Por eso vale
+  // como mando de velocidad y no hace falta tocar nada mas: el hilo que genera
+  // el parpadeo vertical compara ticks del guest, asi que se ajusta solo y no
+  // queda nada desincronizado.
+  //
+  // Antes esto era un 1.0 fijo.
+  aplicar_velocidad_del_juego();
+
+  // Y para poder moverlo desde F4 sin reiniciar. El aviso llega DESPUES de que
+  // el valor nuevo este puesto -asi lo hace SetFlagFromSource-, o sea que
+  // REXCVAR_GET dentro ya devuelve el nuevo y no el anterior.
+  rex::cvar::RegisterChangeCallback(
+      "game_speed", [](std::string_view, std::string_view) { aplicar_velocidad_del_juego(); });
 
   // Enable threading affinity configuration
   thread::EnableAffinityConfiguration();

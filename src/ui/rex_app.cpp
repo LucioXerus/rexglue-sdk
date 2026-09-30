@@ -51,6 +51,39 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+// PARCHE LOCAL - selector de API grafica
+//
+// El plugin ya sabia elegir entre D3D12 y Vulkan por nombre; lo que faltaba
+// era que alguien se lo dijera. Ver plugin_main.cpp:
+//
+//     if (backend == "any" || backend == "d3d12")  -> D3D12GraphicsSystem
+//     if (backend == "any" || backend == "vulkan") -> VulkanGraphicsSystem
+//
+// "any" coge el primero que este compilado, que es D3D12. Con esto se puede
+// forzar uno concreto y comparar.
+//
+// PIDE REINICIO, PERO NO ES DE SOLO LECTURA. La primera version lo puse como
+// kInitOnly, igual que gpu_plugin, y el menu de F4 lo pintaba en rojo y
+// deshabilitado: se veia pero no se podia tocar. Es que kInitOnly significa
+// "no se puede ni guardar el valor nuevo", y aqui si se puede: lo que no se
+// puede es aplicarlo sin reiniciar. Eso es kRequiresRestart, que ademas hace
+// que el SDK lo apunte en su lista de cambios pendientes -y el menu la
+// ensena, con un boton para reiniciar-.
+//
+// Y ya no hay "any". Con any no se sabia cual estaba puesta de verdad, que era
+// justo lo que habia que ensenar. Con dos opciones y ambas explicitas, el
+// ajuste ES la respuesta a "cual se esta usando".
+//
+// El texto va en ingles porque es lo que sale en esa ventana, que es del SDK
+// y esta entera en ingles.
+REXCVAR_DEFINE_STRING(gpu_backend, "d3d12", "GPU",
+                      "Graphics API: d3d12 or vulkan. Takes effect on restart. If the one "
+                      "you pick was not built into this copy, the game falls back to the "
+                      "other one and says so in the log.")
+    .allowed({"d3d12", "vulkan"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+
 namespace rex {
 
 // --- ReXApp ---
@@ -314,7 +347,46 @@ bool ReXApp::SetupPresentation() {
   OnPreSetup(config_);
 
   if (!config_.graphics && !config_.gpu_plugin.empty()) {
-    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin);
+    // PARCHE LOCAL - selector de API grafica
+    //
+    // Antes se llamaba con un solo argumento, asi que el backend quedaba en
+    // "any" por defecto y siempre salia D3D12 por ser el primero del if. El
+    // segundo parametro ya existia en LoadGpuPlugin; solo faltaba usarlo.
+    const std::string backend_elegido = REXCVAR_GET(gpu_backend);
+    REXLOG_INFO("API grafica pedida: {}", backend_elegido);
+    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin, backend_elegido);
+
+    // Si la que se ha pedido no esta compilada en esta copia, el plugin
+    // devuelve nada. Antes de eso significaba pantalla de error y a editar el
+    // toml a mano; ahora se cae a la otra y se dice bien claro. Como solo hay
+    // dos, "any" es exactamente la otra.
+    if (!config_.graphics) {
+      REXLOG_WARN("La API grafica '{}' no esta compilada en esta copia. Se prueba con la otra.",
+                  backend_elegido);
+      config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin, "any");
+      if (config_.graphics) {
+        // Solo hay dos, asi que "any" es exactamente la otra.
+        const char* la_otra = (backend_elegido == "vulkan") ? "d3d12" : "vulkan";
+        REXLOG_WARN("Arrancando con '{}' en su lugar. Cambia gpu_backend para quitar el aviso.",
+                    la_otra);
+      }
+    }
+
+    // Y aqui se borra la lista de "pendiente de reiniciar", que a estas alturas
+    // solo puede tener mentiras.
+    //
+    // SetFlagFromSource apunta en esa lista cualquier cvar kRequiresRestart que
+    // se toque, SIN MIRAR de donde viene el valor. Con lo cual un
+    // --gpu_backend=vulkan en la linea de comandos, que se aplica en el
+    // arranque y ya esta puesto cuando se lee aqui arriba, entraba igualmente
+    // en la lista, y el menu de F4 abria diciendo "Restart needed to apply:
+    // gpu_backend" desde el primer segundo. Un aviso que no se puede quitar
+    // deja de leerse, y entonces tampoco se lee cuando es de verdad.
+    //
+    // Todo lo que hay en la lista en este punto viene del toml o de la linea de
+    // comandos, o sea que ya esta aplicado por definicion. Lo que se cambie
+    // luego desde F4 se vuelve a apuntar y ese aviso si es real.
+    rex::cvar::ClearPendingRestartFlags();
     if (!config_.graphics) {
       // Fatal by design: no silent headless fallback.
       auto msg =

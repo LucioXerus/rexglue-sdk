@@ -1381,14 +1381,23 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   // interfering with GPU command processing, and also to allow tearing so
   // variable refresh rate may be used where it's available.
   // Note: If the priorities here are changes, update the cvar descriptions.
-  if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+  //
+  // The `vsync` cvar (honored here; the stock SDK ignored it on Vulkan, so a
+  // launcher asking for vsync still got IMMEDIATE and uncapped fps): with
+  // vsync on, IMMEDIATE and MAILBOX are skipped because neither waits for
+  // vertical blank -- FIFO_RELAXED tears only on late frames and FIFO always
+  // caps at the display refresh rate. With vsync off the original order is
+  // kept. Applies at swapchain (re)creation; toggling vsync at runtime takes
+  // effect on the next recreation (resize, fullscreen toggle) or restart.
+  const bool want_vsync = REXCVAR_QUERY(bool, vsync);
+  if (!want_vsync && REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
       std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
           present_modes.cend()) {
     // Allowing tearing to reduce latency, and possibly variable refresh rate
     // (though on Windows with borderless fullscreen, GDI copying is used
     // instead of independent flip, so it's not supported there).
     swapchain_create_info.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
-  } else if (REXCVAR_GET(vulkan_allow_present_mode_mailbox) &&
+  } else if (!want_vsync && REXCVAR_GET(vulkan_allow_present_mode_mailbox) &&
              std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_MAILBOX_KHR) !=
                  present_modes.cend()) {
     // Allowing dropping frames to reduce latency, but no tearing.
@@ -1956,10 +1965,72 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
             dfn.vkCmdBeginRenderPass(draw_command_buffer, &swapchain_render_pass_begin_info,
                                      VK_SUBPASS_CONTENTS_INLINE);
             swapchain_image_pass_begun = true;
-            guest_output_viewport.width = float(paint_context_.swapchain_extent.width);
-            guest_output_viewport.height = float(paint_context_.swapchain_extent.height);
-            guest_output_scissor.extent.width = paint_context_.swapchain_extent.width;
-            guest_output_scissor.extent.height = paint_context_.swapchain_extent.height;
+            guest_output_viewport.minDepth = 0.0f;
+            guest_output_viewport.maxDepth = 1.0f;
+            // PARCHE LOCAL - el mosaico a cuadrantes solo aplica con
+            // present_splitscreen_mode=2 (multibox: varias instancias en una
+            // ventana). Con el modo en 0, output_x/output_y == 0 es el caso
+            // normal -el juego llena la ventana- y hay que presentar el
+            // fotograma completo; sin este guarda el juego se veria solo en
+            // la esquina superior izquierda con el resto en negro.
+            const bool present_modo_multibox =
+                REXCVAR_QUERY(int32_t, present_splitscreen_mode) == 2;
+            if (present_modo_multibox &&
+                guest_output_flow.output_x == 0 && guest_output_flow.output_y == 0) {
+              // Player 0: top-left quadrant
+              guest_output_viewport.x = 0.0f;
+              guest_output_viewport.y = 0.0f;
+              guest_output_viewport.width = float(paint_context_.swapchain_extent.width) / 2.0f;
+              guest_output_viewport.height = float(paint_context_.swapchain_extent.height) / 2.0f;
+              guest_output_scissor.offset.x = 0;
+              guest_output_scissor.offset.y = 0;
+              guest_output_scissor.extent.width = paint_context_.swapchain_extent.width / 2;
+              guest_output_scissor.extent.height = paint_context_.swapchain_extent.height / 2;
+            } else if (present_modo_multibox &&
+                       guest_output_flow.output_x > 0 && guest_output_flow.output_y == 0) {
+              // Player 1: top-right quadrant
+              guest_output_viewport.x = float(paint_context_.swapchain_extent.width) / 2.0f;
+              guest_output_viewport.y = 0.0f;
+              guest_output_viewport.width = float(paint_context_.swapchain_extent.width) / 2.0f;
+              guest_output_viewport.height = float(paint_context_.swapchain_extent.height) / 2.0f;
+              guest_output_scissor.offset.x = paint_context_.swapchain_extent.width / 2;
+              guest_output_scissor.offset.y = 0;
+              guest_output_scissor.extent.width = paint_context_.swapchain_extent.width / 2;
+              guest_output_scissor.extent.height = paint_context_.swapchain_extent.height / 2;
+            } else if (present_modo_multibox &&
+                       guest_output_flow.output_x == 0 && guest_output_flow.output_y > 0) {
+              // Player 2: bottom-left quadrant
+              guest_output_viewport.x = 0.0f;
+              guest_output_viewport.y = float(paint_context_.swapchain_extent.height) / 2.0f;
+              guest_output_viewport.width = float(paint_context_.swapchain_extent.width) / 2.0f;
+              guest_output_viewport.height = float(paint_context_.swapchain_extent.height) / 2.0f;
+              guest_output_scissor.offset.x = 0;
+              guest_output_scissor.offset.y = paint_context_.swapchain_extent.height / 2;
+              guest_output_scissor.extent.width = paint_context_.swapchain_extent.width / 2;
+              guest_output_scissor.extent.height = paint_context_.swapchain_extent.height / 2;
+            } else if (present_modo_multibox) {
+              // Player 3: bottom-right quadrant
+              guest_output_viewport.x = float(paint_context_.swapchain_extent.width) / 2.0f;
+              guest_output_viewport.y = float(paint_context_.swapchain_extent.height) / 2.0f;
+              guest_output_viewport.width = float(paint_context_.swapchain_extent.width) / 2.0f;
+              guest_output_viewport.height = float(paint_context_.swapchain_extent.height) / 2.0f;
+              guest_output_scissor.offset.x = paint_context_.swapchain_extent.width / 2;
+              guest_output_scissor.offset.y = paint_context_.swapchain_extent.height / 2;
+              guest_output_scissor.extent.width = paint_context_.swapchain_extent.width / 2;
+              guest_output_scissor.extent.height = paint_context_.swapchain_extent.height / 2;
+            }
+            if (!present_modo_multibox) {
+              // Juego normal -o splitscreen compuesto por el propio juego-:
+              // presentar el fotograma completo, sin recortes a cuadrantes.
+              guest_output_viewport.x = 0.0f;
+              guest_output_viewport.y = 0.0f;
+              guest_output_viewport.width = float(paint_context_.swapchain_extent.width);
+              guest_output_viewport.height = float(paint_context_.swapchain_extent.height);
+              guest_output_scissor.offset.x = 0;
+              guest_output_scissor.offset.y = 0;
+              guest_output_scissor.extent.width = paint_context_.swapchain_extent.width;
+              guest_output_scissor.extent.height = paint_context_.swapchain_extent.height;
+            }
           } else {
             effect_rect_x = 0;
             effect_rect_y = 0;

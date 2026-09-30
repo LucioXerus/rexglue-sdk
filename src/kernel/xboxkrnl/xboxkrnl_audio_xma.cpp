@@ -12,6 +12,8 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <atomic>   // PARCHE LOCAL - escucha de la conversacion XMA v3
+#include <chrono>   // PARCHE LOCAL - escucha de la conversacion XMA v3
 #include <cstring>
 
 #include <rex/assert.h>
@@ -219,6 +221,8 @@ u32 XMASetInputBufferReadOffset_entry(mapped_void context_ptr, u32 value) {
 }
 
 u32 XMASetInputBuffer0_entry(mapped_void context_ptr, mapped_void buffer, u32 packet_count) {
+  REXAPU_DEBUG("[guest] ENTREGA BUFFER 0: ctx={:08X} datos={:08X} paquetes={}",
+               context_ptr.guest_address(), buffer.guest_address(), packet_count);
   uint32_t buffer_physical_address =
       REX_KERNEL_MEMORY()->GetPhysicalAddress(buffer.guest_address());
   assert_true(buffer_physical_address != UINT32_MAX);
@@ -239,13 +243,40 @@ u32 XMASetInputBuffer0_entry(mapped_void context_ptr, mapped_void buffer, u32 pa
   return 0;
 }
 
+// PARCHE LOCAL - escucha de la conversacion XMA v3
+//
+// El bucle del juego llama a estas funciones miles de veces por segundo, asi
+// que van limitadas a una linea por segundo CADA UNA. Cada una lleva su propio
+// reloj -la estatica dentro de la macro-, para que la mas ruidosa no tape a
+// las demas.
+namespace {
+bool XmaDiagToca(std::atomic<int64_t>& ultimo) {
+  const int64_t ahora = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+  int64_t anterior = ultimo.load(std::memory_order_relaxed);
+  return ahora - anterior >= 1000 && ultimo.compare_exchange_strong(anterior, ahora);
+}
+}  // namespace
+
+#define REX_DIAG_XMA(...)                          \
+  do {                                             \
+    static std::atomic<int64_t> _ultimo{0};        \
+    if (XmaDiagToca(_ultimo)) {                    \
+      REXAPU_DEBUG(__VA_ARGS__);                   \
+    }                                              \
+  } while (0)
+
 u32 XMAIsInputBuffer0Valid_entry(mapped_void context_ptr) {
   XMA_CONTEXT_DATA context(context_ptr);
+  REX_DIAG_XMA("[guest] pregunta entrada 0: ctx={:08X} -> {}", context_ptr.guest_address(),
+               uint32_t(context.input_buffer_0_valid));
   return context.input_buffer_0_valid;
 }
 
 u32 XMASetInputBuffer0Valid_entry(mapped_void context_ptr) {
   XMA_CONTEXT_DATA context(context_ptr);
+  REXAPU_DEBUG("[guest] DA ENTRADA 0: ctx={:08X}", context_ptr.guest_address());
   context.input_buffer_0_valid = 1;
   context.Store(context_ptr);
 
@@ -253,6 +284,8 @@ u32 XMASetInputBuffer0Valid_entry(mapped_void context_ptr) {
 }
 
 u32 XMASetInputBuffer1_entry(mapped_void context_ptr, mapped_void buffer, u32 packet_count) {
+  REXAPU_DEBUG("[guest] ENTREGA BUFFER 1: ctx={:08X} datos={:08X} paquetes={}",
+               context_ptr.guest_address(), buffer.guest_address(), packet_count);
   uint32_t buffer_physical_address =
       REX_KERNEL_MEMORY()->GetPhysicalAddress(buffer.guest_address());
   assert_true(buffer_physical_address != UINT32_MAX);
@@ -275,11 +308,14 @@ u32 XMASetInputBuffer1_entry(mapped_void context_ptr, mapped_void buffer, u32 pa
 
 u32 XMAIsInputBuffer1Valid_entry(mapped_void context_ptr) {
   XMA_CONTEXT_DATA context(context_ptr);
+  REX_DIAG_XMA("[guest] pregunta entrada 1: ctx={:08X} -> {}", context_ptr.guest_address(),
+               uint32_t(context.input_buffer_1_valid));
   return context.input_buffer_1_valid;
 }
 
 u32 XMASetInputBuffer1Valid_entry(mapped_void context_ptr) {
   XMA_CONTEXT_DATA context(context_ptr);
+  REXAPU_DEBUG("[guest] DA ENTRADA 1: ctx={:08X}", context_ptr.guest_address());
   context.input_buffer_1_valid = 1;
   context.Store(context_ptr);
 
@@ -288,11 +324,14 @@ u32 XMASetInputBuffer1Valid_entry(mapped_void context_ptr) {
 
 u32 XMAIsOutputBufferValid_entry(mapped_void context_ptr) {
   XMA_CONTEXT_DATA context(context_ptr);
+  REX_DIAG_XMA("[guest] pregunta si la salida vale: ctx={:08X} -> {}", context_ptr.guest_address(),
+               uint32_t(context.output_buffer_valid));
   return context.output_buffer_valid;
 }
 
 u32 XMASetOutputBufferValid_entry(mapped_void context_ptr) {
   XMA_CONTEXT_DATA context(context_ptr);
+  REXAPU_DEBUG("[guest] revalida la salida: ctx={:08X}", context_ptr.guest_address());
   context.output_buffer_valid = 1;
   context.Store(context_ptr);
 
@@ -301,11 +340,18 @@ u32 XMASetOutputBufferValid_entry(mapped_void context_ptr) {
 
 u32 XMAGetOutputBufferReadOffset_entry(mapped_void context_ptr) {
   XMA_CONTEXT_DATA context(context_ptr);
+  REX_DIAG_XMA("[guest] pide lectura: ctx={:08X} lectura={} escritura={} valida={} ent0={} ent1={}",
+               context_ptr.guest_address(), uint32_t(context.output_buffer_read_offset),
+               uint32_t(context.output_buffer_write_offset),
+               uint32_t(context.output_buffer_valid), uint32_t(context.input_buffer_0_valid),
+               uint32_t(context.input_buffer_1_valid));
   return context.output_buffer_read_offset;
 }
 
 u32 XMASetOutputBufferReadOffset_entry(mapped_void context_ptr, u32 value) {
   XMA_CONTEXT_DATA context(context_ptr);
+  REXAPU_DEBUG("[guest] mueve la lectura: ctx={:08X} {} -> {}", context_ptr.guest_address(),
+               uint32_t(context.output_buffer_read_offset), value);
   context.output_buffer_read_offset = value;
   context.Store(context_ptr);
 
@@ -314,6 +360,67 @@ u32 XMASetOutputBufferReadOffset_entry(mapped_void context_ptr, u32 value) {
 
 u32 XMAGetOutputBufferWriteOffset_entry(mapped_void context_ptr) {
   XMA_CONTEXT_DATA context(context_ptr);
+
+  // PARCHE LOCAL - desatasco de la voz XMA
+  //
+  // Aqui es donde el juego se queda girando cuando se cuelga: pide este
+  // offset, pide el de lectura, y vuelta a empezar, para siempre.
+  //
+  // Se vigila un solo contexto a la vez, el ultimo que haya preguntado. No
+  // hace falta mas: cuando se atasca pregunta por uno y solo por uno, asi que
+  // dos enteros atomicos bastan y esto no cuesta nada en el camino normal,
+  // que es lo que importa estando en un bucle tan caliente.
+  {
+    const uint32_t direccion = context_ptr.guest_address();
+    static std::atomic<uint32_t> vigilado{0};
+    static std::atomic<int64_t> desde{0};
+
+    const int64_t ahora = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+
+    if (vigilado.load(std::memory_order_relaxed) != direccion) {
+      vigilado.store(direccion, std::memory_order_relaxed);
+      desde.store(ahora, std::memory_order_relaxed);
+    } else {
+      const int64_t llevo = ahora - desde.load(std::memory_order_relaxed);
+
+      // La foto exacta del atasco, y nada mas que esa:
+      //   salida valida  +  las dos entradas vacias  +  offsets distintos.
+      // Con las entradas vacias el descodificador no puede producir ni una
+      // muestra por mucho que se le insista, asi que esperar no arregla nada.
+      // Y con los offsets distintos el juego nunca llega a preguntar si el
+      // buffer sigue valido, que es su unica salida.
+      const bool atascado = llevo > 250 && context.output_buffer_valid &&
+                            !context.input_buffer_0_valid && !context.input_buffer_1_valid &&
+                            context.output_buffer_write_offset != context.output_buffer_read_offset;
+
+      if (atascado) {
+        REXAPU_WARN(
+            "[desatasco] ctx={:08X} lleva {} ms girando sin entrada "
+            "(escritura={} lectura={}). Le digo que el buffer esta terminado.",
+            direccion, llevo, uint32_t(context.output_buffer_write_offset),
+            uint32_t(context.output_buffer_read_offset));
+
+        // Igualar los dos offsets hace que la resta del juego de cero o
+        // negativo, que es lo que le empuja a preguntar; y apagar la validez
+        // es la respuesta que su codigo entiende como "buffer completo".
+        context.output_buffer_write_offset = context.output_buffer_read_offset;
+        context.output_buffer_valid = 0;
+        context.Store(context_ptr);
+
+        // El reloj se reinicia para no repetirlo en la vuelta siguiente si el
+        // juego tardara un poco en reaccionar.
+        desde.store(ahora, std::memory_order_relaxed);
+        return context.output_buffer_write_offset;
+      }
+    }
+  }
+  REX_DIAG_XMA("[guest] pide escritura: ctx={:08X} escritura={} lectura={} valida={} ent0={} ent1={}",
+               context_ptr.guest_address(), uint32_t(context.output_buffer_write_offset),
+               uint32_t(context.output_buffer_read_offset),
+               uint32_t(context.output_buffer_valid), uint32_t(context.input_buffer_0_valid),
+               uint32_t(context.input_buffer_1_valid));
   return context.output_buffer_write_offset;
 }
 
@@ -323,11 +430,14 @@ u32 XMAGetPacketMetadata_entry(mapped_void context_ptr) {
 }
 
 u32 XMAEnableContext_entry(mapped_void context_ptr) {
+  REX_DIAG_XMA("[guest] enciende el contexto: ctx={:08X}", context_ptr.guest_address());
   StoreXmaContextIndexedRegister(REX_KERNEL_STATE(), 0x1940, context_ptr.guest_address());
   return 0;
 }
 
 u32 XMADisableContext_entry(mapped_void context_ptr, u32 wait) {
+  REXAPU_DEBUG("[guest] apaga el contexto: ctx={:08X} esperar={}", context_ptr.guest_address(),
+               wait);
   X_HRESULT result = X_E_SUCCESS;
   StoreXmaContextIndexedRegister(REX_KERNEL_STATE(), 0x1A40, context_ptr.guest_address());
   if (!static_cast<audio::AudioSystem*>(REX_KERNEL_STATE()->emulator()->audio_system())

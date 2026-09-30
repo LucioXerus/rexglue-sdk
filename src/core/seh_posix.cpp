@@ -14,6 +14,10 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <signal.h>
 #include <cstdlib>  // std::abort()
 
+#if defined(__x86_64__)
+#include <ucontext.h>  // ucontext_t for the SIGFPE self-heal below
+#endif
+
 #include <rex/platform/exceptions.h>
 
 namespace rex::platform {
@@ -31,7 +35,37 @@ int seh_filter(uint32_t /*code*/, void* /*ep*/) {
 }
 
 /// Signal handler for SIGSEGV/SIGBUS/SIGFPE/SIGILL
-static void signal_handler(int sig, siginfo_t* info, void* /*ucontext*/) {
+static void signal_handler(int sig, siginfo_t* info, void* ucontext) {
+#if defined(__x86_64__)
+  // Self-heal for SIMD FP faults with a corrupted exception mask.
+  //
+  // Recompiled guest code executes native divss/divps for PPC fdivs, which
+  // trap with SIGFPE on x/0 when the MXCSR Zero-divide mask (bit 9) is clear.
+  // ReXGlue's host policy is "all FP exceptions masked" (seeded by
+  // FPSCRRegister::InitHost), and neither generated code nor the runtime ever
+  // clears those masks -- but a stale MXCSR can still arrive via
+  // swapcontext/setcontext restoring a recycled fiber ucontext (observed live
+  // value 0x1FB2: ZM cleared). The game itself divides by zero routinely and
+  // expects masked (inf/nan) semantics, so dying here is always wrong.
+  //
+  // Fix the mask IN THE SIGNAL FRAME (a plain _mm_setcsr would be discarded:
+  // sigreturn restores FP state from the frame) and resume; the faulting
+  // instruction re-executes with masked semantics and the game continues.
+  // Only resumes when it actually changed something: an integer divide fault
+  // (idiv) arrives with masks already set and falls through to die as before,
+  // so this cannot turn a genuine crash into an infinite loop.
+  if (sig == SIGFPE) {
+    auto* uc = static_cast<ucontext_t*>(ucontext);
+    if (uc != nullptr && uc->uc_mcontext.fpregs != nullptr) {
+      constexpr uint32_t kExceptionMask = 0x1F80u;  // IM|DM|ZM|OM|UM|PM
+      uint32_t mxcsr = uc->uc_mcontext.fpregs->mxcsr;
+      if ((mxcsr & kExceptionMask) != kExceptionMask) {
+        uc->uc_mcontext.fpregs->mxcsr = mxcsr | kExceptionMask;
+        return;
+      }
+    }
+  }
+#endif
   // Only handle if we're in SEH-protected code
   if (!tls_seh_active) {
     // Not in SEH region - restore default handler and re-raise

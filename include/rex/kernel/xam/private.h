@@ -19,6 +19,15 @@ namespace xam {
 
 bool xeXamIsUIActive();
 
+// PARCHE LOCAL - multijugador local (hasta 4 jugadores).
+//
+// Cuantos usuarios de la consola se dan por buenos (1..4). Esta definida en
+// xam_user.cpp, que es donde vive el ajuste  local_player_count, y la usa
+// tambien xam_input.cpp para XamUserGetDeviceContext. Se declara aqui -el
+// encabezado que ya compartian los dos- a proposito: dos copias del limite
+// acabarian desincronizandose.
+uint32_t LocalPlayerCount();
+
 rex::runtime::Export* RegisterExport_xam(rex::runtime::Export* export_entry);
 
 // Registration functions, one per file.

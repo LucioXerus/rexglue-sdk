@@ -38,6 +38,19 @@ rex::input::InputSystem* input_system() {
   return static_cast<rex::input::InputSystem*>(REX_KERNEL_STATE()->emulator()->input_system());
 }
 
+// PARCHE LOCAL - multijugador local (hasta 4 jugadores).
+//
+// "Este usuario tiene mando / existe". 0xFF es la mascara de "cualquiera", y
+// esa sigue contestando que si aunque el recuento sea 1, para no cambiar nada
+// del comportamiento original. El limite lo pone LocalPlayerCount(), declarada
+// en rex/kernel/xam/private.h y definida en xam_user.cpp junto al ajuste.
+static bool ActiveUserIsLocal(u32 user_index) {
+  if ((user_index & 0xFFu) == 0xFFu) {
+    return true;
+  }
+  return (user_index & 0xFFu) < LocalPlayerCount();
+}
+
 void XamResetInactivity_entry() {
   // Do we need to do anything?
 }
@@ -98,6 +111,24 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
   if (++call_count <= 5) {
     REXKRNL_TRACE("[XAM] XamInputGetState called: user={}, flags=0x{:X}", (uint32_t)user_index,
                   (uint32_t)flags);
+  }
+  // PARCHE LOCAL - diagnostico de multijugador local (solo lectura).
+  //
+  // Una linea por cada indice de usuario que el juego sondee ALGUNA vez, y
+  // nada mas: no cambia lo que se devuelve. Existe para poder contestar con
+  // datos una pregunta que hasta ahora era a ojo -si el juego llega a pedir
+  // las ranuras 1, 2 y 3, o si se queda en la 0 porque su propio codigo no
+  // conoce mas jugadores-. Los datos del juego solo traen TWO_PLAYER, asi que
+  // la respuesta decide si el siguiente trabajo esta en el SDK o en el motor.
+  //
+  // Con local_player_count=1 no imprime nada que no imprimiera antes.
+  {
+    static bool seen[8] = {};
+    uint32_t u = user_index & 0xFFu;
+    if (u < 8 && !seen[u]) {
+      seen[u] = true;
+      REXKRNL_WARN("[LOCALMP] XamInputGetState user_index={} (llamada #{})", u, call_count);
+    }
   }
 
   if ((flags & 0xFF) && (flags & XINPUT_FLAG_GAMEPAD) == 0) {
@@ -188,7 +219,22 @@ i32 XamUserGetDeviceContext_entry(u32 user_index, u32 unk, mapped_u32 out_ptr) {
   // If this function fails they assume zero, so let's fail AND
   // set zero just to be safe.
   *out_ptr = 0;
-  if (!user_index || (user_index & 0xFF) == 0xFF) {
+  // PARCHE LOCAL - multijugador local (hasta 4 jugadores).
+  //
+  // Aqui estaba el segundo muro de la capa de usuarios:
+  //
+  //     if (!user_index || (user_index & 0xFF) == 0xFF) return X_E_SUCCESS;
+  //     else return X_E_DEVICE_NOT_CONNECTED;
+  //
+  // O sea: "el usuario 0 tiene mando, los usuarios 1, 2 y 3 no tienen ninguno".
+  // Cualquier camino que pregunte por esto concluye que no hay mando y no deja
+  // entrar al jugador. Ahora la respuesta la decide el mismo ajuste que el
+  // resto de la capa de usuarios, asi que hay una sola fuente de verdad.
+  //
+  // (Se ha quitado el registro de sondeo [SPLIT-SURVEY] que habia aqui: el
+  // juego no llama a esta funcion en ningun sitio -no esta entre los imports
+  // de default.xex-, asi que no podia imprimir nada.)
+  if (ActiveUserIsLocal(user_index)) {
     return X_E_SUCCESS;
   } else {
     return X_E_DEVICE_NOT_CONNECTED;

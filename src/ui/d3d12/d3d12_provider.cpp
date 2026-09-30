@@ -250,40 +250,112 @@ bool D3D12Provider::Initialize() {
     return false;
   }
 
-  // Choose the adapter.
-  uint32_t adapter_index = 0;
-  IDXGIAdapter1* adapter = nullptr;
-  while (dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
-    DXGI_ADAPTER_DESC1 adapter_desc;
-    if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
-      if (SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device),
-                                             nullptr))) {
-        if (REXCVAR_GET(d3d12_adapter) >= 0) {
-          if (adapter_index == REXCVAR_GET(d3d12_adapter)) {
-            break;
-          }
-        } else if (REXCVAR_GET(d3d12_adapter) == -2) {
-          if (adapter_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
-            break;
-          }
-        } else {
-          if (!(adapter_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
-            break;
+  // ============ PARCHE LOCAL - fallback de GPU y error visible ============
+  //
+  // La busqueda es la de siempre -recorrer adaptadores y quedarse con el
+  // primero que cree un dispositivo D3D12 a feature level 11_0-, solo que
+  // ahora esta en una funcion para poder repetirla.
+  //
+  // Se le pasa si acepta adaptadores marcados como software. Con el valor por
+  // defecto del cvar (-1) la primera pasada los rechaza, igual que antes; si
+  // esa pasada se queda sin candidatos se repite aceptandolos, y ahi es donde
+  // aparece WARP. Antes ese segundo intento no existia: el fallback estaba
+  // implementado pero solo se alcanzaba escribiendo d3d12_adapter=-2 a mano.
+  auto buscar_adaptador = [&](bool aceptar_software) -> IDXGIAdapter1* {
+    uint32_t indice = 0;
+    IDXGIAdapter1* candidato = nullptr;
+    while (dxgi_factory->EnumAdapters1(indice, &candidato) == S_OK) {
+      DXGI_ADAPTER_DESC1 desc;
+      if (SUCCEEDED(candidato->GetDesc1(&desc))) {
+        if (SUCCEEDED(pfn_d3d12_create_device_(candidato, D3D_FEATURE_LEVEL_11_0,
+                                               _uuidof(ID3D12Device), nullptr))) {
+          const bool es_software = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+          if (REXCVAR_GET(d3d12_adapter) >= 0) {
+            // El usuario pidio un indice concreto: se respeta tal cual.
+            if (indice == uint32_t(REXCVAR_GET(d3d12_adapter))) {
+              return candidato;
+            }
+          } else if (REXCVAR_GET(d3d12_adapter) == -2) {
+            // El usuario pidio WARP explicitamente.
+            if (es_software) {
+              return candidato;
+            }
+          } else if (aceptar_software || !es_software) {
+            return candidato;
           }
         }
       }
+      candidato->Release();
+      candidato = nullptr;
+      ++indice;
     }
-    adapter->Release();
-    adapter = nullptr;
-    ++adapter_index;
+    return nullptr;
+  };
+
+  IDXGIAdapter1* adapter = buscar_adaptador(false);
+
+  bool usando_software = false;
+  if (adapter == nullptr && REXCVAR_GET(d3d12_adapter) == -1) {
+    // Ninguna GPU fisica sirve. Antes se acababa aqui.
+    REXLOG_WARN(
+        "No hay ninguna GPU fisica con Direct3D 12 feature level 11_0. "
+        "Probando el rasterizador por software (WARP).");
+    adapter = buscar_adaptador(true);
+    if (adapter != nullptr) {
+      usando_software = true;
+      REXLOG_WARN(
+          "Usando WARP: el render lo hace la CPU. Va a ir MUY lento -unos "
+          "pocos fotogramas por segundo- pero el juego arranca y se ve. "
+          "Actualiza el driver de la GPU para volver a la aceleracion por "
+          "hardware.");
+    }
   }
+
   if (adapter == nullptr) {
+    // Este mensaje se deja PALABRA POR PALABRA como estaba: hay scripts y
+    // logs viejos que lo buscan por texto.
     REXLOG_ERROR(
         "Failed to get an adapter supporting Direct3D 12 with the feature "
         "level of at least 11_0");
+
+    // Y ademas se dice en pantalla, porque a estas alturas la ventana todavia
+    // no existe: sin esto el ejecutable simplemente no hace nada al abrirlo, y
+    // quien lo recibe no tiene forma de distinguirlo de un archivo roto.
+    //
+    // Se carga user32 a mano en vez de enlazarla para no tocar la
+    // configuracion de enlazado del SDK.
+    if (HMODULE user32 = LoadLibraryA("user32.dll")) {
+      using PFN_MessageBoxW = int(WINAPI*)(HWND, LPCWSTR, LPCWSTR, UINT);
+      auto message_box =
+          reinterpret_cast<PFN_MessageBoxW>(GetProcAddress(user32, "MessageBoxW"));
+      if (message_box) {
+        message_box(nullptr,
+                    L"No se ha encontrado ninguna tarjeta grafica compatible.\n"
+                    L"\n"
+                    L"Hace falta Direct3D 12 con feature level 11_0. Eso lo\n"
+                    L"cumple practicamente cualquier GPU de 2012 en adelante,\n"
+                    L"asi que lo mas probable es que el problema sea el driver.\n"
+                    L"\n"
+                    L"Que probar, por orden:\n"
+                    L"  1. Actualizar el driver de la tarjeta grafica.\n"
+                    L"  2. Comprobar que Windows esta al dia.\n"
+                    L"  3. Si es un portatil con dos graficas, forzar que el\n"
+                    L"     juego use la dedicada.\n"
+                    L"\n"
+                    L"Hay mas detalle en la carpeta logs, junto al ejecutable.",
+                    L"Need for Speed: Most Wanted", 0x00000010 /* MB_ICONERROR */);
+      }
+      FreeLibrary(user32);
+    }
+
     dxgi_factory->Release();
     return false;
   }
+
+  if (usando_software) {
+    REXGPU_INFO("Adaptador elegido: WARP (rasterizador por software)");
+  }
+  // ====================== fin del parche local ============================
   DXGI_ADAPTER_DESC adapter_desc;
   if (FAILED(adapter->GetDesc(&adapter_desc))) {
     REXLOG_ERROR("Failed to get the DXGI adapter description");

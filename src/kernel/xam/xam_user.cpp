@@ -30,11 +30,110 @@
 
 REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
 
+// PARCHE LOCAL - privilegios de Xbox Live
+//
+// Apagado por defecto: encendido cambia lo que el juego cree poder hacer, y eso
+// merece ser una decision y no una sorpresa.
+//
+// kHotReload y no kRequiresRestart porque XamUserCheckPrivilege lo lee en cada
+// llamada. Se puede encender desde F4 con el juego abierto; basta con salir del
+// menu que dio el aviso y volver a entrar.
+//
+// El texto va en ingles porque es lo que sale en la ventana de F4, que es del
+// SDK y esta entera en ingles.
+REXCVAR_DEFINE_BOOL(grant_user_privileges, false, "Kernel",
+                    "Tell the game it has every Xbox Live privilege. Off by default, which "
+                    "makes the game refuse to open its multiplayer menus. Turning it on only "
+                    "opens the door: system link also needs the XNet layer, which is only "
+                    "half implemented here.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// PARCHE LOCAL - multijugador local (hasta 4 jugadores).
+//
+// Cuantos jugadores locales existen. Es lo que separa "el juego ve un solo
+// usuario, como siempre" de "el juego ve dos, tres o cuatro".
+//
+// POR QUE HACIA FALTA
+// -------------------
+// La consola tiene cuatro ranuras de usuario (0..3) y la capa de entrada de
+// este SDK ya reparte los mandos entre ellas -rex::input::kMaxGuestUsers-, asi
+// que el bloqueo no estaba ahi. Estaba en esta capa: todas las XamUser* daban
+// por bueno el usuario 0 y contestaban X_E_NO_SUCH_USER a cualquier otro.
+//
+// El juego se lo cree al pie de la letra. En el codigo ya recompilado
+// -app/generated/default/nfsmw_recomp.86.cpp, sub_82849310- hay este bucle,
+// que es la traduccion literal de cuatro instrucciones por vuelta:
+//
+//     for (i = 0; i < 4; i++)
+//       if (XamUserGetSigninState(i)) count++;
+//
+// Con el SDK de fabrica eso solo puede devolver 1. Y lo primero que hace la
+// pantalla de "selecciona jugador 2" es preguntar. De ahi el muro.
+//
+// POR QUE 1 Y NO 4 POR DEFECTO
+// ----------------------------
+// Con 4 por defecto, cualquier partida guardada de un jugador arrancaria con
+// la consola creyendo que hay cuatro sesiones abiertas. El valor 1 reproduce
+// el comportamiento de siempre, bit a bit, y a partir de ahi es cosa del
+// jugador subir el numero.
+//
+// QUE NO HACE
+// -----------
+// Abre la puerta de la capa de usuarios. No inventa los menus, los textos ni
+// las vistas que la version de 360 no trae: los datos del juego solo conocen
+// TWO_PLAYER (ver docs/diario/multijugador-local.md). Con 2 ya deberia
+// comportarse como el splitscreen original; 3 y 4 dependen de que el motor
+// acepte ranuras que sus datos no declaran.
+//
+// kHotReload como sus vecinos: se lee en cada llamada, asi que se puede
+// cambiar desde F4 sin cerrar el juego.
+REXCVAR_DEFINE_UINT32(local_player_count, 1, "Kernel",
+                      "How many local players the console reports as signed in (1-4). 1 keeps "
+                      "the original behaviour and nothing changes. Set it to 2 for the "
+                      "original two-player split screen, or 3/4 to let the game see the "
+                      "extra slots. Hot-reloadable.")
+    .range(1, 4)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex {
 namespace kernel {
 namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
+
+// PARCHE LOCAL - multijugador local.
+//
+// Cuantos usuarios de la consola se dan por buenos. Se lee en CADA llamada,
+// no se cachea en una variable global, para que el ajuste de F4 surta efecto
+// sin reiniciar.
+//
+// Sin static, y declarada en rex/kernel/xam/private.h, porque la usa tambien
+// xam_input.cpp (XamUserGetDeviceContext).
+uint32_t LocalPlayerCount() {
+  uint32_t count = REXCVAR_GET(local_player_count);
+  if (count < 1) {
+    count = 1;
+  }
+  if (count > kMaxLocalUsers) {
+    count = kMaxLocalUsers;
+  }
+  return count;
+}
+
+// Devuelve el perfil de esa ranura si la ranura esta activa, y nullptr si no.
+// nullptr es exactamente lo que los XamUser* de abajo traducen a
+// X_E_NO_SUCH_USER, asi que la condicion se escribe una sola vez.
+static UserProfile* ActiveUserProfile(uint32_t user_index) {
+  if (user_index >= LocalPlayerCount()) {
+    return nullptr;
+  }
+  return REX_KERNEL_STATE()->user_profile(user_index);
+}
+
+// La mascara de "que usuario?" que usan casi todas las XamUser*: 0xFF quiere
+// decir "cualquiera". En ese caso el usuario 0 es la respuesta de siempre.
+static bool IsAnyUser(uint32_t user_index) { return (user_index & 0xFFu) == 0xFFu; }
+
 
 i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   assert_true(type_mask == 1 || type_mask == 2 || type_mask == 3 || type_mask == 4 ||
@@ -44,9 +143,13 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   }
   uint32_t result = X_E_NO_SUCH_USER;
   uint64_t xuid = 0;
-  if (user_index < 4) {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+  if (user_index >= kMaxLocalUsers) {
+    result = X_E_INVALIDARG;
+  } else {
+    // PARCHE LOCAL - multijugador local: esto era  if (user_index == 0)  y
+    // cualquier otra ranura se quedaba con X_E_NO_SUCH_USER.
+    UserProfile* user_profile = ActiveUserProfile(user_index);
+    if (user_profile != nullptr) {
       auto type = user_profile->type() & type_mask;
       if (type & (2 | 4)) {
         // maybe online profile?
@@ -58,22 +161,55 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
         result = X_E_SUCCESS;
       }
     }
-  } else {
-    result = X_E_INVALIDARG;
   }
   *xuid_ptr = xuid;
   return result;
 }
 
 u32 XamUserGetSigninState_entry(u32 user_index) {
-  uint32_t signin_state = 0;
-  if (user_index < 4) {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      signin_state = user_profile->signin_state();
+  // PARCHE LOCAL - multijugador local (hasta 4 jugadores).
+  //
+  // Aqui estaba el muro. Antes:
+  //
+  //     uint32_t signin_state = 0;
+  //     if (user_index < 4) {
+  //       if (user_index == 0) { ...unico perfil... }
+  //     }
+  //     return signin_state;
+  //
+  // O sea: las ranuras 1, 2 y 3 contestaban 0 -"aqui no hay nadie"- pasara lo
+  // que pasara. Y esta es justo la funcion sobre la que el juego cuenta
+  // jugadores (sub_82849310 en el codigo recompilado), asi que la cuenta le
+  // salia 1 por mucho que hubiera cuatro mandos enchufados.
+  //
+  // Con local_player_count = 1 el resultado es identico al de antes: solo la
+  // ranura 0 tiene perfil activo.
+  UserProfile* user_profile = ActiveUserProfile(user_index);
+
+  // PARCHE LOCAL - diagnostico de multijugador local (solo lectura).
+  //
+  // Lo primero que se imprime es el recuento efectivo -para que el log diga
+  // con que se esta jugando-, y luego una linea por ranura sondeada. Responde
+  // a la pregunta que decide donde esta el siguiente trabajo: "el juego
+  // pregunta por el jugador 2, o se queda en el 0?". No cambia el valor que se
+  // devuelve.
+  {
+    static bool seen[8] = {};
+    static bool reported_count = false;
+    if (!reported_count) {
+      reported_count = true;
+      REXKRNL_WARN("[LOCALMP] local_player_count={}; usuarios con sesion iniciada={}",
+                   LocalPlayerCount(), LocalPlayerCount());
+    }
+    uint32_t u = user_index & 0xFFu;
+    if (u < 8 && !seen[u]) {
+      seen[u] = true;
+      REXKRNL_WARN("[LOCALMP] XamUserGetSigninState user_index={} -> {}", u,
+                   user_profile != nullptr ? user_profile->signin_state() : 0u);
     }
   }
-  return signin_state;
+
+  return user_profile != nullptr ? user_profile->signin_state() : 0;
 }
 
 typedef struct {
@@ -92,11 +228,13 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
   }
 
   std::memset(info, 0, sizeof(X_USER_SIGNIN_INFO));
-  if (user_index) {
+  // PARCHE LOCAL - multijugador local (hasta 4 jugadores).
+  // Antes:  if (user_index) return X_E_NO_SUCH_USER;
+  UserProfile* user_profile = ActiveUserProfile(user_index);
+  if (user_profile == nullptr) {
     return X_E_NO_SUCH_USER;
   }
 
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   info->xuid = user_profile->xuid();
   info->signin_state = user_profile->signin_state();
   rex::string::copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
@@ -104,26 +242,31 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
 }
 
 u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
-  if (user_index >= 4) {
+  if (user_index >= kMaxLocalUsers) {
     return X_E_INVALIDARG;
   }
 
-  if (user_index) {
+  // PARCHE LOCAL - multijugador local: antes  if (user_index) return
+  // X_E_NO_SUCH_USER;  El jugador 2 pide su nombre al entrar en la partida.
+  UserProfile* user_profile = ActiveUserProfile(user_index);
+  if (user_profile == nullptr) {
     return X_E_NO_SUCH_USER;
   }
 
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   const auto& user_name = user_profile->name();
   rex::string::copy_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
   return X_E_SUCCESS;
 }
 
 u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_len) {
-  if (user_index >= 4) {
+  if (user_index >= kMaxLocalUsers) {
     return X_E_INVALIDARG;
   }
 
-  if (user_index) {
+  // PARCHE LOCAL - multijugador local: antes  if (user_index) return
+  // X_E_NO_SUCH_USER;
+  UserProfile* user_profile = ActiveUserProfile(user_index);
+  if (user_profile == nullptr) {
     return X_E_NO_SUCH_USER;
   }
 
@@ -131,7 +274,6 @@ u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_l
     return X_E_INVALIDARG;
   }
 
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   auto user_name = rex::string::to_utf16(user_profile->name());
   rex::string::copy_and_swap_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
   return X_E_SUCCESS;
@@ -211,17 +353,25 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   // Title ID = 0 means us.
   // 0xfffe07d1 = profile?
 
-  if (!xuids && user_index) {
-    // Only support user 0.
-    if (overlapped) {
-      REX_KERNEL_STATE()->CompleteOverlappedImmediate(
-          REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_NO_SUCH_USER);
-      return X_ERROR_IO_PENDING;
+  // PARCHE LOCAL - multijugador local (hasta 4 jugadores).
+  // Antes:  if (!xuids && user_index) -> X_ERROR_NO_SUCH_USER, o sea que leer
+  // los ajustes del jugador 2 era imposible y la pantalla de seleccion de
+  // coche del jugador 2 se quedaba sin datos del perfil.
+  //
+  // Con xuids la llamada pregunta por un perfil concreto por su XUID, y ese
+  // camino sigue siendo el del jugador 1: no hay indice de XUIDs ajenos.
+  UserProfile* user_profile = REX_KERNEL_STATE()->user_profile();
+  if (!xuids) {
+    user_profile = ActiveUserProfile(user_index);
+    if (user_profile == nullptr) {
+      if (overlapped) {
+        REX_KERNEL_STATE()->CompleteOverlappedImmediate(
+            REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_NO_SUCH_USER);
+        return X_ERROR_IO_PENDING;
+      }
+      return X_ERROR_NO_SUCH_USER;
     }
-    return X_ERROR_NO_SUCH_USER;
   }
-
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
 
   // First call asks for size (fill buffer_size_ptr).
   // Second call asks for buffer contents with that size.
@@ -308,8 +458,11 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
     return X_ERROR_INVALID_PARAMETER;
   }
 
-  if (user_index) {
-    // Only support user 0.
+  // PARCHE LOCAL - multijugador local (hasta 4 jugadores).
+  // Antes:  if (user_index) -> X_ERROR_NO_SUCH_USER, asi que guardar los
+  // ajustes del jugador 2 tambien fallaba.
+  UserProfile* user_profile = ActiveUserProfile(user_index);
+  if (user_profile == nullptr) {
     if (overlapped) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped.guest_address(),
                                                       X_ERROR_NO_SUCH_USER);
@@ -317,9 +470,6 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
     }
     return X_ERROR_NO_SUCH_USER;
   }
-
-  // Update and save settings.
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
 
   for (uint32_t n = 0; n < setting_count; ++n) {
     const X_USER_PROFILE_SETTING& setting = settings[n];
@@ -373,22 +523,49 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
 u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) {
   // checking all users?
   if (user_index != 0xFF) {
-    if (user_index >= 4) {
+    if (user_index >= kMaxLocalUsers) {
       return X_ERROR_INVALID_PARAMETER;
     }
 
-    if (user_index) {
+    // PARCHE LOCAL - multijugador local (hasta 4 jugadores).
+    // Antes:  if (user_index) return X_ERROR_NO_SUCH_USER;  Con eso el jugador
+    // 2 salia del menu multijugador con el cartel de "no tienes privilegios",
+    // porque ni siquiera se llegaba a mirar grant_user_privileges.
+    if (ActiveUserProfile(user_index) == nullptr) {
       return X_ERROR_NO_SUCH_USER;
     }
   }
 
-  // If we deny everything, games should hopefully not try to do stuff.
-  *out_value = 0;
+  // PARCHE LOCAL - privilegios de Xbox Live
+  //
+  // Aqui decia esto, y hacia exactamente lo que dice:
+  //
+  //     // If we deny everything, games should hopefully not try to do stuff.
+  //     *out_value = 0;
+  //
+  // Deniega todos los privilegios, siempre, sea cual sea el que pregunten. Es
+  // de Xenia y para un emulador sin Xbox Live se entiende: si el juego se cree
+  // sin permisos ni lo intenta, y no se cuelga contra servidores apagados.
+  //
+  // En Most Wanted el efecto es el cartel "Los privilegios que tienes en Xbox
+  // Live no te permiten acceder a esta funcion" nada mas tocar el multijugador.
+  // Que ademas se contradice con el resto del SDK: XamUserIsOnlineEnabled
+  // devuelve 1, XamUserGetMembershipTier devuelve 6 -que es Gold- y el perfil
+  // dice signin_state 1 y type local|online. El unico que decia que no era este.
+  //
+  // OJO CON LO QUE ESTO NO HACE. Abre la puerta del menu y nada mas. El System
+  // Link de detras necesita la capa XNet, y en este SDK faltan XNetCreateKey,
+  // XNetRegisterKey, XNetUnregisterKey, XNetConnect y XNetGetConnectStatus,
+  // ademas de que los manejadores de sesion de xgi_app.cpp devuelven exito sin
+  // hacer nada. Esto sirve para ver donde esta el siguiente muro, no para
+  // jugar en red.
+  *out_value = REXCVAR_GET(grant_user_privileges) ? 1 : 0;
   return X_ERROR_SUCCESS;
 }
 
 u32 XamUserContentRestrictionGetFlags_entry(u32 user_index, mapped_u32 out_flags) {
-  if (user_index) {
+  // PARCHE LOCAL - multijugador local: antes  if (user_index).
+  if (ActiveUserProfile(user_index) == nullptr) {
     return X_ERROR_NO_SUCH_USER;
   }
 
@@ -399,7 +576,8 @@ u32 XamUserContentRestrictionGetFlags_entry(u32 user_index, mapped_u32 out_flags
 
 u32 XamUserContentRestrictionGetRating_entry(u32 user_index, u32 unk1, mapped_u32 out_unk2,
                                              mapped_u32 out_unk3) {
-  if (user_index) {
+  // PARCHE LOCAL - multijugador local: antes  if (user_index).
+  if (ActiveUserProfile(user_index) == nullptr) {
     return X_ERROR_NO_SUCH_USER;
   }
 
@@ -427,10 +605,12 @@ u32 XamUserIsOnlineEnabled_entry(u32 user_index) {
 }
 
 u32 XamUserGetMembershipTier_entry(u32 user_index) {
-  if (user_index >= 4) {
+  if (user_index >= kMaxLocalUsers) {
     return X_ERROR_INVALID_PARAMETER;
   }
-  if (user_index) {
+  // PARCHE LOCAL - multijugador local: antes  if (user_index) return
+  // X_ERROR_NO_SUCH_USER.  La membresia es la misma para todos: Gold.
+  if (ActiveUserProfile(user_index) == nullptr) {
     return X_ERROR_NO_SUCH_USER;
   }
   return 6 /* 6 appears to be Gold */;
@@ -441,21 +621,20 @@ u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 
   uint32_t are_friends = 0;
   X_RESULT result;
 
-  if (user_index >= 4) {
+  if (user_index >= kMaxLocalUsers) {
     result = X_ERROR_INVALID_PARAMETER;
   } else {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      if (user_profile->signin_state() == 0) {
-        result = X_ERROR_NOT_LOGGED_ON;
-      } else {
-        // No friends!
-        are_friends = 0;
-        result = X_ERROR_SUCCESS;
-      }
-    } else {
-      // Only support user 0.
+    // PARCHE LOCAL - multijugador local (hasta 4 jugadores).
+    // Antes:  if (user_index == 0) { ... } else { X_ERROR_NO_SUCH_USER }
+    UserProfile* user_profile = ActiveUserProfile(user_index);
+    if (user_profile == nullptr) {
       result = X_ERROR_NO_SUCH_USER;  // if user is local -> X_ERROR_NOT_LOGGED_ON
+    } else if (user_profile->signin_state() == 0) {
+      result = X_ERROR_NOT_LOGGED_ON;
+    } else {
+      // No friends!
+      are_friends = 0;
+      result = X_ERROR_SUCCESS;
     }
   }
 

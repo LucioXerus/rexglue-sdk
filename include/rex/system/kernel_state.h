@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <filesystem>
@@ -199,7 +200,15 @@ class KernelState {
 
   xam::AppManager* app_manager() const { return app_manager_.get(); }
   xam::ContentManager* content_manager() const { return content_manager_.get(); }
-  xam::UserProfile* user_profile() const { return user_profile_.get(); }
+  // PARCHE LOCAL - multijugador local (hasta 4 jugadores).
+  // user_profile() sin argumento sigue siendo el perfil del jugador 1, para no
+  // tocar los ~15 sitios que ya lo usaban -contenido, guardado, logros-.
+  // La version con indice devuelve nullptr fuera de rango, que es lo que
+  // quieren todos los XamUser* para contestar X_E_NO_SUCH_USER.
+  xam::UserProfile* user_profile() const { return user_profile(0); }
+  xam::UserProfile* user_profile(uint32_t user_index) const {
+    return user_index < xam::kMaxLocalUsers ? user_profiles_[user_index].get() : nullptr;
+  }
 
   // Access must be guarded by the global critical region.
   util::ObjectTable* object_table() { return &object_table_; }
@@ -353,7 +362,10 @@ class KernelState {
 
   std::unique_ptr<xam::AppManager> app_manager_;
   std::unique_ptr<xam::ContentManager> content_manager_;
-  std::unique_ptr<xam::UserProfile> user_profile_;
+  // PARCHE LOCAL - multijugador local. Antes: un unico perfil.
+  // std::array y no un vector: cuatro ranuras fijas, sin reservas ni
+  // reasignaciones, y asi user_profile(i) no puede fallar por memoria.
+  std::array<std::unique_ptr<xam::UserProfile>, xam::kMaxLocalUsers> user_profiles_;
 
   rex::thread::global_critical_region global_critical_region_;
 

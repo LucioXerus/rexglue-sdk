@@ -13,8 +13,27 @@
 #include <rex/cvar.h>
 #include <rex/string.h>
 #include <rex/string/numeric.h>
+#include <rex/logging.h>  // PARCHE LOCAL - para dejar constancia del restaurado
 #include <rex/ui/keybinds.h>
 #include <imgui.h>
+
+#include <cstdlib>  // PARCHE LOCAL - std::_Exit, para el boton de reiniciar
+#include <utility>  // PARCHE LOCAL - std::pair, que llegaba de rebote por <map>
+
+// PARCHE LOCAL - para relanzar el juego desde el boton de reiniciar.
+//
+// Las dos guardas van como en src/ui/windowed_app_main_sdl.cpp, que ya incluye
+// windows.h de esta manera. NOMINMAX importa aqui de verdad: sin el, windows.h
+// define min y max como macros y este fichero usa std::min y std::max.
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include <algorithm>
 #include <map>
@@ -158,6 +177,32 @@ static rex::ui::VirtualKey ImGuiKeyToVirtualKey(ImGuiKey key) {
 
 void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
   auto& registry = rex::cvar::GetRegistry();
+
+  // PARCHE LOCAL - foto de la configuracion de partida
+  //
+  // Es a lo que vuelve el boton "Restore defaults", y no a los valores de
+  // fabrica del SDK. La diferencia importa: el nfsmw.toml deja puestas cosas
+  // -el motor de video, el filtrado- que son la configuracion buena de este
+  // juego. Restaurar a los valores del SDK dejaria una que nunca se ha usado,
+  // y encima peor.
+  //
+  // Se toma la primera vez que se dibuja esta ventana. En la practica eso es
+  // el arranque, porque nada de aqui cambia solo. Si alguien hubiera tocado
+  // algo por la consola antes de abrir F4, esa seria la foto; el aviso del
+  // boton lo dice para que no sorprenda.
+  //
+  // Los cvars del complemento de GPU se registran al cargar su DLL, que es
+  // mucho antes de que nadie pulse F4, asi que entran en la foto igual.
+  static std::vector<std::pair<std::string, std::string>> configuracion_de_partida;
+  static bool foto_tomada = false;
+  if (!foto_tomada) {
+    foto_tomada = true;
+    configuracion_de_partida.reserve(registry.size());
+    for (auto& e : registry) {
+      configuracion_de_partida.emplace_back(e.name, e.getter());
+    }
+    REXLOG_DEBUG("[ajustes] foto de partida: {} valores", configuracion_de_partida.size());
+  }
 
   // Collect sorted unique category paths.
   std::set<std::string> category_set;
@@ -472,13 +517,36 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
           rex::cvar::SetFlagByName(entry.name, std::to_string(v));
         }
       } else if (entry.type == rex::cvar::FlagType::Double) {
-        double v = std::atof(current_val.c_str());
-        if (ImGui::InputDouble("##v", &v, 0.0, 0.0, "%.4f")) {
-          if (entry.constraints.min)
-            v = std::max(v, *entry.constraints.min);
-          if (entry.constraints.max)
-            v = std::min(v, *entry.constraints.max);
-          rex::cvar::SetFlagByName(entry.name, std::to_string(v));
+        // PARCHE LOCAL - deslizador cuando el ajuste trae minimo y maximo.
+        //
+        // Con la caja de texto hay que escribir el numero y darle a Enter. Para
+        // un ajuste que se busca a tanteo -la velocidad del juego, sin ir mas
+        // lejos- eso es incomodo: no puedes arrastrar y ver el efecto. Con
+        // limites conocidos, un deslizador es lo suyo; sin ellos no hay por
+        // donde deslizar, asi que se queda la caja de siempre.
+        //
+        // Ctrl+clic sobre el deslizador sigue dejando escribir el valor exacto.
+        if (entry.constraints.min.has_value() && entry.constraints.max.has_value()) {
+          float v = static_cast<float>(std::atof(current_val.c_str()));
+          const float vmin = static_cast<float>(*entry.constraints.min);
+          const float vmax = static_cast<float>(*entry.constraints.max);
+          // Cuantos decimales enseniar. Un recorrido largo -0 a 200, que es un
+          // porcentaje- se lee mejor entero; uno corto -0 a 1- necesita
+          // decimales o la barra parece que no hace nada.
+          const char* formato = (vmax - vmin >= 10.0f) ? "%.0f" : "%.3f";
+          if (ImGui::SliderFloat("##v", &v, vmin, vmax, formato)) {
+            v = std::clamp(v, vmin, vmax);
+            rex::cvar::SetFlagByName(entry.name, std::to_string(v));
+          }
+        } else {
+          double v = std::atof(current_val.c_str());
+          if (ImGui::InputDouble("##v", &v, 0.0, 0.0, "%.4f")) {
+            if (entry.constraints.min)
+              v = std::max(v, *entry.constraints.min);
+            if (entry.constraints.max)
+              v = std::min(v, *entry.constraints.max);
+            rex::cvar::SetFlagByName(entry.name, std::to_string(v));
+          }
         }
       } else if (entry.type == rex::cvar::FlagType::Command) {
         if (ImGui::Button(std::string(entry.name + "##v").c_str())) {
@@ -500,13 +568,176 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
   }
   ImGui::EndChild();
 
+  // PARCHE LOCAL - aviso de reinicio pendiente, con boton para reiniciar
+  //
+  // El SDK ya llevaba la cuenta de los ajustes cambiados que piden reinicio
+  // -SetFlagFromSource llama a MarkPendingRestart, y GetPendingRestartFlags los
+  // devuelve-, pero no lo ensenaba en ninguna parte. Sin eso, cambiar la API
+  // grafica o cualquier otro de esos parecia no hacer nada: pones el valor,
+  // vuelves al juego, y todo sigue igual sin una sola pista de por que.
+  //
+  // Sirve para todos, no solo para el de la API.
+  {
+    // La API grafica, leida del registro de cvars por nombre.
+    //
+    // La primera version de esto usaba una variable global compartida con
+    // rex_app.cpp, y NO ENLAZABA: rex_app.cpp no se compila dentro del SDK,
+    // se instala como fuente y lo compila cada aplicacion, asi que la
+    // definicion acaba en el .exe y esta referencia en la DLL. El registro de
+    // cvars, en cambio, esta hecho justo para hablar entre modulos.
+    //
+    // Y desde que se quito "any" de las opciones, el ajuste ES la API: el
+    // unico caso en que no coincide es que la elegida no este compilada en
+    // esta copia, y entonces el arranque lo deja escrito en el log.
+    ImGui::Separator();
+    ImGui::Text("Graphics API: %s", rex::cvar::GetFlagByName("gpu_backend").c_str());
+
+    const auto pendientes_reinicio = rex::cvar::GetPendingRestartFlags();
+    if (!pendientes_reinicio.empty()) {
+      std::string lista;
+      for (const auto& n : pendientes_reinicio) {
+        if (!lista.empty()) {
+          lista += ", ";
+        }
+        lista += n;
+      }
+      ImGui::TextColored(imgui_drawer()->style().settings.warning,
+                         "Restart needed to apply: %s", lista.c_str());
+#if defined(_WIN32)
+      // Guarda ANTES de reiniciar, y no es un extra: estos ajustes solo viven
+      // en memoria hasta que se guardan. Reiniciar sin guardar volveria con el
+      // valor viejo y pareceria que el boton no hace nada.
+      if (ImGui::Button("Save and restart")) {
+        rex::cvar::SaveConfig(config_path_);
+
+        // Sin std::size a proposito: sale de <iterator>, que este fichero no
+        // incluye y que llega de rebote segun la implementacion. Una constante
+        // no depende de nada.
+        constexpr DWORD kMaxRuta = 1024;
+        wchar_t ruta[kMaxRuta];
+        const DWORD largo = GetModuleFileNameW(nullptr, ruta, kMaxRuta);
+        bool relanzado = false;
+        if (largo > 0 && largo < kMaxRuta) {
+          // La misma linea de comandos con la que se abrio, para no perder la
+          // ISO ni las opciones que le pasa el lanzador. CreateProcessW puede
+          // escribir en ese buffer, asi que se le da una copia propia.
+          std::wstring linea = GetCommandLineW();
+          std::vector<wchar_t> linea_editable(linea.begin(), linea.end());
+          linea_editable.push_back(L'\0');
+
+          STARTUPINFOW si{};
+          si.cb = sizeof(si);
+          PROCESS_INFORMATION pi{};
+          if (CreateProcessW(ruta, linea_editable.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                             nullptr, &si, &pi)) {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            relanzado = true;
+          }
+        }
+
+        if (relanzado) {
+          REXLOG_INFO("[ajustes] reiniciando para aplicar: {}", lista);
+          // Misma salida que usa la app al cerrar la ventana: vaciar el log y
+          // cortar en seco. El desmontaje ordenado puede quedarse colgado en un
+          // cerrojo que dejo algun hilo del juego, y por eso el SDK tampoco lo
+          // hace ahi.
+          rex::FlushLogging();
+          std::_Exit(0);
+        }
+        REXLOG_ERROR("[ajustes] no se pudo relanzar el juego (error {}). Cierralo y abrelo tu.",
+                     GetLastError());
+      }
+      ImGui::SameLine();
+      ImGui::TextDisabled("(saves first, then opens again with the same options)");
+#else
+      ImGui::TextDisabled("Close the game and open it again to apply.");
+#endif
+    }
+  }
+
   // Bottom bar: Save button.
   ImGui::Separator();
   if (ImGui::Button("Save to config")) {
     rex::cvar::SaveConfig(config_path_);
   }
   ImGui::SameLine();
+
+  // PARCHE LOCAL - boton de restaurar la configuracion de partida
+  //
+  // Va detras de una confirmacion a proposito: esta pegado al de guardar y es
+  // destructivo. Un clic de mas no puede costar media tarde de ajustes.
+  if (ImGui::Button("Restore defaults")) {
+    ImGui::OpenPopup("Restore defaults?##rex_restore");
+  }
+  ImGui::SameLine();
   ImGui::TextDisabled("(%s)", config_path_.filename().string().c_str());
+
+  if (ImGui::BeginPopupModal("Restore defaults?##rex_restore", nullptr,
+                             ImGuiWindowFlags_AlwaysAutoResize)) {
+    ImGui::TextUnformatted("Every setting goes back to how it was when the game started,");
+    ImGui::TextUnformatted("with your config file already applied.");
+    ImGui::Spacing();
+    ImGui::BulletText("Read-only settings are left alone: they are fixed when the\n"
+                      "game starts, so changing them now would do nothing.");
+    ImGui::BulletText("Settings that need a restart do change, but only take\n"
+                      "effect the next time you start the game.");
+    ImGui::BulletText("%s is NOT written. Press \"Save to config\"\n"
+                      "afterwards if you want this to survive a restart.",
+                      config_path_.filename().string().c_str());
+    ImGui::Separator();
+
+    if (ImGui::Button("Restore", ImVec2(120.0f, 0))) {
+      // Se recoge la lista ANTES de tocar nada. SetFlagByName escribe en la
+      // entrada del registro -al menos su origen-, y no me apetece estar
+      // recorriendo el contenedor mientras se modifica.
+      std::vector<std::pair<std::string, std::string>> pendientes;
+      for (auto& e : registry) {
+        // Solo lectura: fijados al arrancar. Entre ellos esta el motor de
+        // video, que es justo el que no queremos perder.
+        if (e.lifecycle == rex::cvar::Lifecycle::kInitOnly) {
+          continue;
+        }
+        // Los comandos son botones, no tienen valor que restaurar.
+        if (e.type == rex::cvar::FlagType::Command) {
+          continue;
+        }
+
+        // El valor de la foto de partida. Si el ajuste no estaba -se registro
+        // despues de abrir esta ventana la primera vez, que es raro pero
+        // posible- se cae al valor de fabrica, que es lo unico que se sabe.
+        const std::string* objetivo = nullptr;
+        for (auto& [nombre, valor] : configuracion_de_partida) {
+          if (nombre == e.name) {
+            objetivo = &valor;
+            break;
+          }
+        }
+        const std::string& valor_bueno = objetivo ? *objetivo : e.default_value;
+
+        if (e.getter() == valor_bueno) {
+          continue;
+        }
+        pendientes.emplace_back(e.name, valor_bueno);
+      }
+
+      int restaurados = 0;
+      for (auto& [nombre, valor] : pendientes) {
+        if (rex::cvar::SetFlagByName(nombre, valor)) {
+          ++restaurados;
+        }
+      }
+      REXLOG_INFO("[ajustes] {} de {} valores devueltos a la configuracion de partida",
+                  restaurados, pendientes.size());
+      ImGui::CloseCurrentPopup();
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(120.0f, 0))) {
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+  }
 
   ImGui::End();
 }

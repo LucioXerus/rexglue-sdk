@@ -23,12 +23,38 @@
 
 #include <cassert>
 
+#if defined(__x86_64__)
+// <x86intrin.h> for _mm_getcsr/_mm_setcsr (diagnostic hardening, see below).
+#include <x86intrin.h>
+
+namespace rex::thread::detail {
+// Host FP exception policy: all SIMD FP exceptions masked. Guest code assumes
+// this (the recompiler emits native divss/divps for PPC fdivs, which trap on
+// x/0 unless the Zero-divide mask is set). ReXGlue seeds this policy at thread
+// start (FPSCRRegister::InitHost) but ucontext save/restore in swapcontext can
+// reinstate a stale MXCSR from a recycled fiber context, so re-assert it after
+// every fiber switch. Cost when already correct: one stmxcsr (no serializing
+// ldmxcsr). See NFSMW-Recompiled Linux bring-up notes (SIGFPE/MXCSR 0x1FB2).
+inline void ReassertHostFpMasks() noexcept {
+  constexpr uint32_t kExceptionMask = 0x1F80u;  // IM|DM|ZM|OM|UM|PM
+  const uint32_t csr = _mm_getcsr();
+  if ((csr & kExceptionMask) != kExceptionMask) [[unlikely]] {
+    _mm_setcsr(csr | kExceptionMask);
+  }
+}
+}  // namespace rex::thread::detail
+#endif  // defined(__x86_64__)
+
 namespace rex::thread {
 
 thread_local Fiber* Fiber::tls_current_ = nullptr;
 
 Fiber* Fiber::ConvertCurrentThread() {
   auto* f = new Fiber();
+#if defined(__x86_64__)
+  // Don't seed the new ucontext with a stale MXCSR.
+  detail::ReassertHostFpMasks();
+#endif
   if (getcontext(&f->context_) == -1) {
     delete f;
     return nullptr;
@@ -44,6 +70,10 @@ Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
   f->arg_ = arg;
   f->stack_.resize(stack_size);
 
+#if defined(__x86_64__)
+  // Don't seed the new ucontext with a stale MXCSR.
+  detail::ReassertHostFpMasks();
+#endif
   if (getcontext(&f->context_) == -1) {
     delete f;
     return nullptr;
@@ -66,6 +96,12 @@ void Fiber::SwitchTo(Fiber* target) {
   Fiber* from = tls_current_;
   tls_current_ = target;
   swapcontext(&from->context_, &target->context_);
+#if defined(__x86_64__)
+  // swapcontext restores MXCSR from the target ucontext; a stale/recycled
+  // context can unmask FP exceptions (observed: ZM cleared -> SIGFPE on the
+  // next x/0.0 divss in recompiled guest code). Re-assert host policy.
+  detail::ReassertHostFpMasks();
+#endif
 }
 
 void Fiber::Destroy() {

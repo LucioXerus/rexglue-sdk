@@ -609,6 +609,34 @@ void XThread::Execute() {
 
   auto* dispatcher = runtime->function_dispatcher();
   auto* memory = runtime->memory();
+
+  // PARCHE LOCAL - diagnostico y ruido v3
+  //
+  // Una linea por hilo del guest que arranca. Los puntos de entrada de los
+  // hilos son INVISIBLES para el analisis estatico -la direccion se pasa como
+  // parametro a ExCreateThread, no aparece como destino de ningun salto-, asi
+  // que sin esto no hay forma de saber cuantos hilos crea el juego, en que
+  // orden ni cual es el que no vuelve.
+  //
+  // Y lleva r13, el PCR y el TLS a proposito: esta linea sale SIEMPRE, tanto
+  // si el arranque va bien como si no. Es la unica forma de comparar un
+  // arranque bueno con uno malo mirando exactamente lo mismo en las dos
+  // maquinas, en vez de mirar solo la que falla.
+  //
+  // Nivel info y una sola linea por hilo: no cambia el timing de forma
+  // apreciable, que es justo lo que hay que cuidar cuando se persigue algo
+  // que solo pasa en maquinas rapidas.
+  {
+    auto* ctx_log = thread_state_ ? thread_state_->context() : nullptr;
+    REXSYS_INFO(
+        "[hilo guest] arrancando: entrada=0x{:08X} start_address=0x{:08X} "
+        "contexto=0x{:08X} trampolin_xapi=0x{:08X} pila={} bytes | "
+        "pcr=0x{:08X} tls=0x{:08X} r13=0x{:08X} r1=0x{:08X}",
+        address, creation_params_.start_address, creation_params_.start_context,
+        creation_params_.xapi_thread_startup, creation_params_.stack_size, pcr_address_,
+        tls_static_address_, ctx_log ? ctx_log->r13.u32 : 0u, ctx_log ? ctx_log->r1.u32 : 0u);
+  }
+
   PPCFunc* func = dispatcher->GetFunction(address);
   if (!func) {
     REXSYS_ERROR("XThread::Execute - No function registered at {:08X}", address);
@@ -899,7 +927,28 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
       thread_->set_affinity_mask(uint64_t(1) << cpu_index);
     }
   } else {
-    REXSYS_WARN("Too few processor cores - scheduling will be wonky");
+    // PARCHE LOCAL - diagnostico y ruido v3
+    //
+    // Este aviso salia UNA VEZ POR LLAMADA, y SetActiveCpu se llama cada vez
+    // que el juego crea un hilo o le cambia la CPU. Medido en una partida
+    // real: 44.803 avisos en 44 segundos -unos mil por segundo-, y 105 MB de
+    // log en un cuarto de hora. El 100% de las lineas del log eran esta.
+    //
+    // No es solo ruido. Cada linea es un formateo, un cerrojo y una escritura
+    // a disco, hecha DESDE UN HILO DEL JUEGO. En un equipo de dos nucleos
+    // -que es justo el caso en el que esta rama se ejecuta- eso le roba la
+    // CPU al resto: el audio se corta y el juego se vuelve un barrizal.
+    //
+    // O sea que el aviso que dice "aqui va a ir mal" era, el mismo, una parte
+    // importante de por que iba mal.
+    //
+    // Se deja una sola vez por proceso. El texto original se conserva entero
+    // para no romper nada que lo busque.
+    static std::atomic_flag avisado = ATOMIC_FLAG_INIT;
+    if (!avisado.test_and_set(std::memory_order_relaxed)) {
+      REXSYS_WARN("Too few processor cores - scheduling will be wonky"
+                  " (este aviso solo se muestra una vez por ejecucion)");
+    }
   }
 }
 
