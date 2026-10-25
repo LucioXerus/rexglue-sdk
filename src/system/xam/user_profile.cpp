@@ -21,12 +21,18 @@ namespace rex {
 namespace system {
 namespace xam {
 
-UserProfile::UserProfile() {
+UserProfile::UserProfile(uint32_t user_index) : user_index_(user_index) {
   // 58410A1F checks the user XUID against a mask of 0x00C0000000000000 (3<<54),
   // if non-zero, it prevents the user from playing the game.
   // "You do not have permissions to perform this operation."
-  xuid_ = 0xB13EBABEBABEBABE;
-  name_ = "User";
+  // Only the low byte of that 32-bit XOR survives, so a profile XUID has to end
+  // in 0xBE like the main one: Call of Duty: Black Ops II indexes a table with
+  // the XUID and reads far out of bounds for other low bytes.
+  xuid_ = 0xB13EBABEBABEBABE + (static_cast<uint64_t>(user_index) << 32);
+  // Every local user needs a distinct name: titles that key players by name
+  // (Call of Duty's lobby lists the same profile twice otherwise) cannot tell
+  // two identically named profiles apart.
+  name_ = user_index ? fmt::format("Player {}", user_index + 1) : "User";
 
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195
   // https://github.com/arkem/py360/blob/master/py360/constants.py
@@ -133,7 +139,7 @@ UserProfile::Setting* UserProfile::GetSetting(uint32_t setting_id) {
 
 void UserProfile::LoadSetting(UserProfile::Setting* setting) {
   if (setting->is_title_specific()) {
-    auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath();
+    auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath(user_index_);
     auto setting_id = fmt::format("{:08X}", setting->setting_id);
     auto file_path = content_dir / setting_id;
     auto file = rex::filesystem::OpenFile(file_path, "rb");
@@ -158,7 +164,7 @@ void UserProfile::LoadSetting(UserProfile::Setting* setting) {
 void UserProfile::SaveSetting(UserProfile::Setting* setting) {
   if (setting->is_title_specific()) {
     auto serialized_setting = setting->Serialize();
-    auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath();
+    auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath(user_index_);
     std::filesystem::create_directories(content_dir);
     auto setting_id = fmt::format("{:08X}", setting->setting_id);
     auto file_path = content_dir / setting_id;

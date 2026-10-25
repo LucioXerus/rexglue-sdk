@@ -27,6 +27,7 @@
 #include <rex/stream.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/mmio_handler.h>
+#include <rex/system/thread_state.h>
 #include <rex/system/xmemory.h>
 #include <rex/thread.h>
 
@@ -547,6 +548,17 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
         "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
         is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
         rex::thread::current_thread_id());
+    if (auto* ts = rex::runtime::ThreadState::Get()) {
+      if (auto* ctx = ts->context()) {
+        const uint32_t* r = reinterpret_cast<const uint32_t*>(&ctx->r3);
+        REXSYS_ERROR(
+            "  guest state: lr=0x{:08X} r0={:08X} r1={:08X} r2={:08X} r3={:08X} r4={:08X} "
+            "r5={:08X} r6={:08X} r7={:08X} r8={:08X} r9={:08X} r10={:08X} r11={:08X} "
+            "r12={:08X} r13={:08X} r27={:08X} r28={:08X} r29={:08X} r30={:08X} r31={:08X}",
+            static_cast<uint32_t>(ctx->lr), r[1], r[2], r[3], r[0], r[4], r[5], r[6], r[7], r[8],
+            r[9], r[10], r[11], r[12], r[13], r[26], r[27], r[28], r[29], r[30]);
+      }
+    }
     return false;
   }
 

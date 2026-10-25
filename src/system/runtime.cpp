@@ -142,6 +142,11 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
         input_system_.reset();
       } else {
         REXSYS_DEBUG("Input system initialized");
+        // Split screen: sign local users in as their controllers are connected.
+        system::KernelState* kernel = kernel_state_.get();
+        input_system_->SetUsersChangedCallback(
+            [kernel](uint32_t mask) { kernel->OnInputUsersChanged(mask); });
+        kernel->OnInputUsersChanged(input_system_->ConnectedUserMask());
       }
     }
   }

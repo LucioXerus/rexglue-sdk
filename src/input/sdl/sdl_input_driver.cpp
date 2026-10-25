@@ -162,6 +162,11 @@ void SDLInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
                      static_cast<int>(sizeof(guid_text)));
     info.guid = guid_text;
     info.synthetic = false;
+    // Ordinal is the guest user this pad feeds (see SlotAssignment). Leave it
+    // unset here so InputSystem::RefreshDevices assigns it as the lowest free
+    // slot; publishing the controller-array position made every pad claim
+    // ordinal 0 on a fresh enumeration, so pads beyond the first were dropped
+    // and guest users 1-3 reported DEVICE_NOT_CONNECTED.
     out.push_back(info);
   }
 }
